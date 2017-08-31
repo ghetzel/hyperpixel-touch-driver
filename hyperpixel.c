@@ -172,7 +172,7 @@ static int hyperpixel_touch_probe(struct i2c_client *client,
     //   INT_MODE[1] = 1 \  assert interrupt
     //   INT_MODE[0] = 0 /  on touch
     //
-    i2c_smbus_write_byte_data(client, 0x6e, 0xe);
+    i2c_smbus_write_byte_data(client, 0x6e, BIT_MASK(0xe));
 
 err_free_irq:
     free_irq(client->irq, hpx);
