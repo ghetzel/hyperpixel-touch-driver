@@ -195,7 +195,8 @@ static int hyperpixel_touch_remove(struct i2c_client *client)
     return 0;
 }
 
-static SIMPLE_DEV_PM_OPS(wacom_i2c_pm, wacom_i2c_suspend, wacom_i2c_resume);
+// static SIMPLE_DEV_PM_OPS(hyperpixel_touch_power_management,
+//     hyperpixel_touch_suspend, hyperpixel_touch_resume);
 
 static const struct i2c_device_id hyperpixel_touch_id[] = {
     { "HPX_TOUCH_A035VL01", 0 },
