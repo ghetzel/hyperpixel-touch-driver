@@ -4,7 +4,10 @@ obj-m := hyperpixel.o
 KDIR ?= /lib/modules/`uname -r`/build
 
 default:
-	$(MAKE) -C $(KDIR) M=$$PWD
+	ARCH=arm CROSS_COMPILE=arm-linux-gnueabihf- $(MAKE) -C $(KDIR) M=$$PWD
+
+install:
+	ARCH=arm CROSS_COMPILE=arm-linux-gnueabihf- $(MAKE) -C $(KDIR) M=$$PWD modules_install
 
 clean:
 	-rm *.cmd .*.cmd .tmp_versions

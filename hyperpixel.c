@@ -1,46 +1,74 @@
 /*
- * PiMoroni Hyperpixel touchscreen (I2C bus, screen AUO A035VL01-V0)
+ * Pimoroni Hyperpixel touchscreen (I2C bus, screen AUO A035VL01-V0)
  *
  * Copyright (C) 2017 Gary Hetzel
  *
  * Licensed under the GPL-2 or later.
  */
 
+#include <linux/delay.h>
+#include <linux/gpio.h>
 #include <linux/i2c.h>
-#include <linux/input.h>    /* BUS_I2C */
+#include <linux/input.h>
+#include <linux/input/mt.h>
 #include <linux/interrupt.h>
 #include <linux/irq.h>
 #include <linux/module.h>
 #include <linux/pm.h>
 #include <linux/slab.h>
 #include <linux/types.h>
+#include <linux/workqueue.h>
 
-#define HYPERPIXEL_ADDR        0x5c
+#define HYPERPIXEL_MAX_TOUCHES       2
+#define HYPERPIXEL_I2C_BUS           3
+#define HYPERPIXEL_I2C_ADDR_A035VL01 0x5c
+#define HYPERPIXEL_GPIO_BCM          27
 
 struct hyperpixel_dev {
     struct i2c_client *client;
     struct input_dev *input;
+    struct delayed_work worker;
 };
 
-static irqreturn_t hyperpixel_touch_irq(int irq, void *dev_id)
+static struct i2c_board_info hpx_a035vl01 = {
+    I2C_BOARD_INFO("hyperpixel", HYPERPIXEL_I2C_ADDR_A035VL01),
+};
+
+
+// -----------------------------------------------------------------------------
+static irqreturn_t hyperpixel_touch_irq_top(int irq, void *irq_data)
 {
+    struct hyperpixel_dev *hpx = irq_data;
+
+    schedule_delayed_work(&hpx->worker, 0);
+
+    return IRQ_HANDLED;
+}
+
+
+static void hyperpixel_touch_irq_bottom(struct work_struct *work)
+{
+    struct hyperpixel_dev *hpx = container_of(work, struct hyperpixel_dev,
+        worker.work);
+    struct i2c_client *client = hpx->client;
     int error;
     int x1, y1, x2, y2;
-    struct hyperpixel_dev *hpx = dev_id;
     u8 data[8];
 
     // read touch details from I2C
-    error = i2c_smbus_read_i2c_block_data(hpx->client, 0x40, 8, data);
+    error = i2c_smbus_read_i2c_block_data(client, 0x40, 8, data);
 
     if (error < 0) {
-        dev_err(&hpx->client->dev, "Data read error %d\n", error);
-        return IRQ_HANDLED;
+        dev_err(&client->dev, "Data read error %d\n", error);
+        return;
     }
 
     x1 = data[0] | (data[4] << 8);
     y1 = data[1] | (data[5] << 8);
     x2 = data[2] | (data[6] << 8);
     y2 = data[3] | (data[7] << 8);
+
+    printk(KERN_INFO "HPX: 1=(%d,%d) 2=(%d,%d)", x1, y1, x2, y2);
 
     // TODO: pickup from https://github.com/pimoroni/hyperpixel/blob/master/requirements/usr/bin/hyperpixel-touch#L234
     //
@@ -61,7 +89,7 @@ static irqreturn_t hyperpixel_touch_irq(int irq, void *dev_id)
     //     input_report_abs(input, ABS_MT_POSITION_Y, y2);
     // }
 
-    return IRQ_HANDLED;
+    return;
 }
 
 // Think these are for request_threaded_irq
@@ -83,17 +111,26 @@ static irqreturn_t hyperpixel_touch_irq(int irq, void *dev_id)
 
 //     disable_irq(client->irq);
 // }
-// -----------------------------------------------------------------------------
 
+
+// -----------------------------------------------------------------------------
 static int hyperpixel_touch_probe(struct i2c_client *client,
-                     const struct i2c_device_id *id)
+    const struct i2c_device_id *id)
 {
     struct hyperpixel_dev *hpx;
+    struct device *dev = &client->dev;
     struct input_dev *input;
     int error;
 
+    dev_dbg(dev, "Probing for Pimoroni Hyperpixel Touschreen driver");
+
+    if (client->irq <= 0) {
+        dev_err(dev, "No IRQ!\n");
+        return -EINVAL;
+    }
+
     if (!i2c_check_functionality(client->adapter, I2C_FUNC_I2C)) {
-        dev_err(&client->dev, "i2c_check_functionality error\n");
+        dev_err(dev, "i2c_check_functionality error\n");
         return -EIO;
     }
 
@@ -104,17 +141,17 @@ static int hyperpixel_touch_probe(struct i2c_client *client,
 
     if (!hpx || !input) {
         error = -ENOMEM;
+        printk(KERN_CRIT "Failed to allocate devices: %d\n", error);
         goto err_free_irq;
     }
 
     hpx->client = client;
     hpx->input = input;
+    INIT_DELAYED_WORK(&hpx->worker, hyperpixel_touch_irq_bottom);
 
-    input->name = "PiMoroni Hyperpixel Touchscreen Driver";
+    input->name = "Pimoroni Hyperpixel Touchscreen Driver";
     input->id.bustype = BUS_I2C;
-    input->id.vendor = 0xFF; // TODO: find out what this ought to be
-    input->id.version = 0x01;
-    input->dev.parent = &client->dev;
+    input->dev.parent = dev;
 
     // this has something to do with using request_threaded_irq
     //
@@ -123,10 +160,13 @@ static int hyperpixel_touch_probe(struct i2c_client *client,
 
     input->evbit[0] |= BIT_MASK(EV_KEY) | BIT_MASK(EV_ABS);
 
+    __set_bit(EV_KEY, input->evbit);
+    __set_bit(EV_ABS, input->evbit);
     __set_bit(BTN_TOUCH, input->keybit);
 
     input_set_abs_params(input, ABS_X, 0, 800, 0, 0);
     input_set_abs_params(input, ABS_Y, 0, 480, 0, 0);
+    input_mt_init_slots(input, HYPERPIXEL_MAX_TOUCHES, 0);
     input_set_abs_params(input, ABS_MT_SLOT, 0, 1, 0, 0);
     input_set_abs_params(input, ABS_MT_TRACKING_ID, 0, 65535, 0, 0);
     input_set_abs_params(input, ABS_MT_POSITION_X, 0, 800, 0, 0);
@@ -134,13 +174,15 @@ static int hyperpixel_touch_probe(struct i2c_client *client,
 
     // associate our struct with the input device
     input_set_drvdata(input, hpx);
+    i2c_set_clientdata(client, hpx);
 
     // setup interrupt handler
-    error = request_irq(client->irq, hyperpixel_touch_irq, 0, "hyperpixel_touch", hpx);
+    error = request_irq(client->irq,
+        hyperpixel_touch_irq_top, 0, client->name, hpx);
 
     if (error) {
-        dev_err(&client->dev,
-            "Failed to enable IRQ, error: %d\n", error);
+        dev_err(dev,
+            "Failed to enable IRQ %d, error: %d\n", client->irq, error);
         goto err_free_mem;
     }
 
@@ -150,19 +192,30 @@ static int hyperpixel_touch_probe(struct i2c_client *client,
     error = input_register_device(input);
 
     if (error) {
-        dev_err(&client->dev,
+        dev_err(dev,
             "Failed to register input device, error: %d\n", error);
         goto err_free_irq;
     }
 
-    i2c_set_clientdata(client, hpx);
-    return 0;
+    // GPIO initialization
+    // -------------------
+    error = gpio_request(HYPERPIXEL_GPIO_BCM, "hyperpixel-touch");
 
-    // from https://github.com/pimoroni/hyperpixel/blob/master/requirements/usr/bin/hyperpixel-touch#L99-L101
-    //
-    // gpio.setmode(gpio.BCM)
-    // gpio.setwarnings(False)
-    // gpio.setup(INT, gpio.IN)  // INT = 27
+    if (error) {
+        dev_err(dev,
+            "Failed to request GPIO, error: %d\n", error);
+        goto err_free_irq;
+    }
+
+    error = gpio_direction_input(HYPERPIXEL_GPIO_BCM);
+
+    if (error) {
+        dev_err(dev,
+            "Failed to initialize GPIO, error: %d\n", error);
+        goto err_free_irq;
+    }
+
+    gpio_export(client->addr, false);
 
     // configure controller interrupts
     //   EN_INT      = 1    enable interrupts
@@ -170,7 +223,16 @@ static int hyperpixel_touch_probe(struct i2c_client *client,
     //   INT_MODE[1] = 1 \  assert interrupt
     //   INT_MODE[0] = 0 /  on touch
     //
-    i2c_smbus_write_byte_data(client, 0x6e, 0xe);
+    error = i2c_smbus_write_byte_data(client, 0x6e, 0xe);
+
+    if (error) {
+        dev_err(dev,
+            "Failed to register input device, error: %d\n", error);
+        goto err_free_irq;
+    }
+
+    printk(KERN_INFO "Pimoroni Hyperpixel successfully initialized.");
+    return 0;
 
 err_free_irq:
     free_irq(client->irq, hpx);
@@ -182,6 +244,8 @@ err_free_mem:
     return error;
 }
 
+
+// -----------------------------------------------------------------------------
 static int hyperpixel_touch_remove(struct i2c_client *client)
 {
     struct hyperpixel_dev *hpx = i2c_get_clientdata(client);
@@ -189,31 +253,54 @@ static int hyperpixel_touch_remove(struct i2c_client *client)
     free_irq(client->irq, hpx);
     input_unregister_device(hpx->input);
     kfree(hpx);
+    printk(KERN_INFO "Pimoroni Hyperpixel disabled.");
 
     return 0;
 }
 
-// static SIMPLE_DEV_PM_OPS(hyperpixel_touch_power_management,
-//     hyperpixel_touch_suspend, hyperpixel_touch_resume);
-
-static const struct i2c_device_id hyperpixel_touch_id[] = {
-    { "HPX_TOUCH_A035VL01", 0 },
-    { },
+static const struct i2c_device_id hyperpixel_touch_ids[] = {
+    {"hyperpixel", 0},
+    { }
 };
-MODULE_DEVICE_TABLE(i2c, hyperpixel_touch_id);
+MODULE_DEVICE_TABLE(i2c, hyperpixel_touch_ids);
+
 
 static struct i2c_driver hyperpixel_touch_driver = {
     .driver = {
-        .name   = "hyperpixel_touch",
+        .name   = "hyperpixel",
         // .pm = &hyperpixel_touch_power_management,
     },
-
+    .id_table   = hyperpixel_touch_ids,
     .probe      = hyperpixel_touch_probe,
     .remove     = hyperpixel_touch_remove,
-    .id_table   = hyperpixel_touch_id,
 };
-module_i2c_driver(hyperpixel_touch_driver);
+
+
+// -----------------------------------------------------------------------------
+static int __init hyperpixel_touch_init(void)
+{
+    struct i2c_adapter *adapter;
+
+    adapter = i2c_get_adapter(HYPERPIXEL_I2C_BUS);
+
+    i2c_new_device(adapter, &hpx_a035vl01);
+
+    return i2c_add_driver(&hyperpixel_touch_driver);
+}
+module_init(hyperpixel_touch_init);
+
+
+// -----------------------------------------------------------------------------
+static void __exit hyperpixel_touch_exit(void)
+{
+    i2c_del_driver(&hyperpixel_touch_driver);
+}
+module_exit(hyperpixel_touch_exit);
+
+
+// static SIMPLE_DEV_PM_OPS(hyperpixel_touch_power_management,
+//     hyperpixel_touch_suspend, hyperpixel_touch_resume);
 
 MODULE_AUTHOR("Gary Hetzel <garyhetzel@gmail.com>");
-MODULE_DESCRIPTION("PiMoroni Hyperpixel Touchscreen driver");
+MODULE_DESCRIPTION("Pimoroni Hyperpixel Touchscreen driver");
 MODULE_LICENSE("GPL");
