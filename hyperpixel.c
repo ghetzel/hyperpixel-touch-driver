@@ -6,18 +6,17 @@
  * Licensed under the GPL-2 or later.
  */
 
-#include <linux/input.h>    /* BUS_I2C */
 #include <linux/i2c.h>
+#include <linux/input.h>    /* BUS_I2C */
+#include <linux/interrupt.h>
+#include <linux/irq.h>
 #include <linux/module.h>
-#include <linux/types.h>
-#include <linux/of.h>
 #include <linux/pm.h>
+#include <linux/slab.h>
+#include <linux/types.h>
 
-#define HYPERPIXEL_BUS         0x03
 #define HYPERPIXEL_ADDR        0x5c
 
-// the example uses this global.  i don't like it, but don't yet know
-// enough to not use it
 struct hyperpixel_dev {
     struct i2c_client *client;
     struct input_dev *input;
@@ -28,15 +27,14 @@ static irqreturn_t hyperpixel_touch_irq(int irq, void *dev_id)
     int error;
     int x1, y1, x2, y2;
     struct hyperpixel_dev *hpx = dev_id;
-    struct input_dev *input = hpx->input;
-    u8 *data[8];
+    u8 data[8];
 
     // read touch details from I2C
     error = i2c_smbus_read_i2c_block_data(hpx->client, 0x40, 8, data);
 
     if (error < 0) {
-        dev_err(input, "Data read error %d\n", error);
-        return;
+        dev_err(&hpx->client->dev, "Data read error %d\n", error);
+        return IRQ_HANDLED;
     }
 
     x1 = data[0] | (data[4] << 8);
@@ -172,7 +170,7 @@ static int hyperpixel_touch_probe(struct i2c_client *client,
     //   INT_MODE[1] = 1 \  assert interrupt
     //   INT_MODE[0] = 0 /  on touch
     //
-    i2c_smbus_write_byte_data(client, 0x6e, BIT_MASK(0xe));
+    i2c_smbus_write_byte_data(client, 0x6e, 0xe);
 
 err_free_irq:
     free_irq(client->irq, hpx);
