@@ -1,0 +1,31 @@
+/*
+ * Device tree overlay for HyperPixel Touchscreen
+ *
+ * Compile:
+ * dtc -@ -I dts -O dtb -o hyperpixel-touchscreen.dtbo hyperpixel-touchscreen.dts
+ */
+
+/dts-v1/;
+/plugin/;
+
+/{
+    compatible = "brcm,bcm2835", "brcm,bcm2836", "brcm,bcm2708", "brcm,bcm2709";
+
+    fragment@0 {
+        target-path = "/";
+        __overlay__ {
+            i2c@0 {
+                bridge@5c {
+                    compatible = "hyperpixel";
+                    interrupts = <79>;
+                    reg = <0x5c>;
+                };
+
+            };
+        };
+    };
+
+    __symbols__ {
+        hpx_touchscreen = "/fragment@0/__overlay__/hpx_touchscreen";
+    };
+};

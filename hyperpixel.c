@@ -6,7 +6,7 @@
  * Licensed under the GPL-2 or later.
  */
 
-	#include <linux/gpio.h>
+#include <linux/gpio.h>
 #include <linux/i2c.h>
 #include <linux/i2c-smbus.h>
 #include <linux/input.h>
@@ -19,11 +19,11 @@
 #include <linux/slab.h>
 #include <linux/types.h>
 
-#define POLL_INTERVAL                3
+#define POLL_INTERVAL_MS             3
 #define HYPERPIXEL_DRIVER_NAME       "hyperpixel"
+
+// TODO: these might make more sense as DeviceTree variables
 #define HYPERPIXEL_MAX_TOUCHES       2
-#define HYPERPIXEL_I2C_BUS           3
-#define HYPERPIXEL_I2C_ADDR_A035VL01 0x5c
 #define HYPERPIXEL_GPIO_BCM          27
 #define HYPERPIXEL_DEFAULT_WIDTH     800
 #define HYPERPIXEL_COLS              13
@@ -51,6 +51,9 @@ struct hyperpixel_dev {
 	int height;
 };
 
+// Takes bounds and coordinates as input and returns which ADC lines those
+// coordinates correspond to.
+// -----------------------------------------------------------------------------
 static void hyperpixel_touch_get_lines_from_coords(int max, int px_per,
 	int coord1, int coord2, int *out1, int *out2)
 {
@@ -79,6 +82,8 @@ static void hyperpixel_touch_get_lines_from_coords(int max, int px_per,
 	}
 }
 
+// Reports a single observation to the input subsystem.
+// -----------------------------------------------------------------------------
 static void hyperpixel_touch_report_input(struct input_dev *input,
 	int contact_num, int x, int y, int state, struct coords *last)
 {
@@ -117,6 +122,10 @@ static void hyperpixel_touch_report_input(struct input_dev *input,
 	}
 }
 
+
+// Performs a single input observation iteration (which can be triggered by
+// either an interrupt or polling cycle).
+// -----------------------------------------------------------------------------
 static void hyperpixel_touch_sync(struct hyperpixel_dev *hpx)
 {
 	struct i2c_client *client = hpx->client;
@@ -138,7 +147,10 @@ static void hyperpixel_touch_sync(struct hyperpixel_dev *hpx)
 	int c2_down = 0;
 
 	u8 data[8];
-	s32 sx1_adc, sy1_adc, sx2_adc, sy2_adc;
+	s32 sx1_adc = 0;
+	s32 sy1_adc = 0;
+	s32 sx2_adc = 0;
+	s32 sy2_adc = 0;
 
 	// read touch details from I2C
 	error = i2c_smbus_read_i2c_block_data(client, 0x40, 8, data);
@@ -194,20 +206,22 @@ static void hyperpixel_touch_sync(struct hyperpixel_dev *hpx)
 	return;
 }
 
+// Implements the "top" (hardware) interrupt handler.
 // -----------------------------------------------------------------------------
-// static irqreturn_t hyperpixel_touch_hardirq(int irq, void *irq_data)
-// {
-// 	struct hyperpixel_dev *hpx = irq_data;
+static irqreturn_t hyperpixel_touch_hardirq(int irq, void *irq_data)
+{
+	struct hyperpixel_dev *hpx = irq_data;
 
-// 	if(hpx) {
-// 		printk(KERN_INFO "HPX: i understood that reference\n");
-// 		return IRQ_HANDLED;
-// 	} else {
-// 		printk(KERN_INFO "HPX: NOPE\n");
-// 		return IRQ_NONE;
-// 	}
-// }
+	if(hpx) {
+		printk(KERN_INFO "HPX: i understood that reference\n");
+		return IRQ_HANDLED;
+	} else {
+		printk(KERN_INFO "HPX: NOPE\n");
+		return IRQ_NONE;
+	}
+}
 
+// Implements the "bottom" (soft) interrupt handler.
 // -----------------------------------------------------------------------------
 static irqreturn_t hyperpixel_touch_irq(int irq, void *irq_data)
 {
@@ -220,6 +234,8 @@ static irqreturn_t hyperpixel_touch_irq(int irq, void *irq_data)
 	return IRQ_HANDLED;
 }
 
+// Performs an input observation in response to a polling cycle iteration.
+// -----------------------------------------------------------------------------
 static void hyperpixel_touch_poll(struct input_polled_dev *dev)
 {
 	struct hyperpixel_dev *hpx = dev->private;
@@ -249,6 +265,7 @@ static void hyperpixel_touch_poll(struct input_polled_dev *dev)
 // }
 
 
+// Performs hardware setup and initialization on module load.
 // -----------------------------------------------------------------------------
 static int hyperpixel_touch_probe(struct i2c_client *client,
 	const struct i2c_device_id *id)
@@ -261,19 +278,11 @@ static int hyperpixel_touch_probe(struct i2c_client *client,
 
 	dev_dbg(dev, "Probing for Pimoroni Hyperpixel Touschreen driver");
 
-	if (client->irq <= 0) {
-		// dev_err(dev, "No IRQ!\n");
-		// return -EINVAL;
-		client->irq = 79;
-	}
-
 	if (!i2c_check_functionality(client->adapter, I2C_FUNC_I2C)) {
 		dev_err(dev, "i2c_check_functionality error\n");
 		return -EIO;
 	}
 
-	// allocate and configure the device as it will appear in /dev/input
-	//
 	hpx = kzalloc(sizeof(*hpx), GFP_KERNEL);
 
 	hpx->width = HYPERPIXEL_DEFAULT_WIDTH;
@@ -288,7 +297,7 @@ static int hyperpixel_touch_probe(struct i2c_client *client,
 	}
 
 	// setup polled or IRQ-driven input
-	if(POLL_INTERVAL) {
+	if (POLL_INTERVAL_MS) {
 		poll = input_allocate_polled_device();
 
 		if (!poll) {
@@ -301,11 +310,17 @@ static int hyperpixel_touch_probe(struct i2c_client *client,
 		input = poll->input;
 
 		hpx->poll->private = hpx;
-		hpx->poll->poll_interval = POLL_INTERVAL;
+		hpx->poll->poll_interval = POLL_INTERVAL_MS;
 		hpx->poll->poll = hyperpixel_touch_poll;
 
 		printk(KERN_INFO "Touchscreen polling on %dms interval\n", hpx->poll->poll_interval);
 	} else {
+		if (client->irq <= 0) {
+			dev_err(dev, "No IRQ!\n");
+			error = -EINVAL;
+			goto err_free_mem;
+		}
+
 		input = input_allocate_device();
 
 		if (!input) {
@@ -344,28 +359,28 @@ static int hyperpixel_touch_probe(struct i2c_client *client,
 	input_set_drvdata(input, hpx);
 	i2c_set_clientdata(client, hpx);
 
-	// setup interrupt handler
-	// error = request_threaded_irq(client->irq, hyperpixel_touch_hardirq,
-	// 	hyperpixel_touch_irq,
-	// 	IRQF_SHARED,
-	// 	client->name, hpx);
-
-	error = request_irq(client->irq, hyperpixel_touch_irq,
-		IRQF_SHARED,
-		client->name, hpx);
-
-	if (error) {
-		dev_err(dev,
-			"Failed to enable IRQ %d, error: %d\n", client->irq, error);
-		goto err_free_mem;
-	}
-
 	// register input devices
-	if(hpx->poll) {
+	if (hpx->poll) {
 		error = input_register_polled_device(hpx->poll);
 	} else {
+		// setup interrupt handler
+		// error = request_threaded_irq(client->irq, hyperpixel_touch_hardirq,
+		// 	hyperpixel_touch_irq,
+		// 	IRQF_SHARED,
+		// 	client->name, hpx);
+
+		error = request_irq(client->irq, hyperpixel_touch_irq,
+			IRQF_SHARED,
+			client->name, hpx);
+
+		if (error) {
+			dev_err(dev,
+				"Failed to enable IRQ %d, error: %d\n", client->irq, error);
+			goto err_free_mem;
+		}
+
 		// disabled IRQ, hyperpixel_touch_open will enable it
-		// disable_irq(client->irq);
+		disable_irq(client->irq);
 
 		error = input_register_device(hpx->input);
 	}
@@ -431,6 +446,7 @@ err_free_mem:
 }
 
 
+// Performs hardware teardown and reset on module unload.
 // -----------------------------------------------------------------------------
 static int hyperpixel_touch_remove(struct i2c_client *client)
 {
@@ -453,12 +469,12 @@ static int hyperpixel_touch_remove(struct i2c_client *client)
 	return 0;
 }
 
+// Make the i2c subsystem aware of us
 static const struct i2c_device_id hyperpixel_touch_ids[] = {
 	{HYPERPIXEL_DRIVER_NAME, 0},
 	{ }
 };
 MODULE_DEVICE_TABLE(i2c, hyperpixel_touch_ids);
-
 
 static struct i2c_driver hyperpixel_touch_driver = {
 	.driver = {
