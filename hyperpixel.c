@@ -6,8 +6,7 @@
  * Licensed under the GPL-2 or later.
  */
 
-#include <linux/delay.h>
-#include <linux/gpio.h>
+	#include <linux/gpio.h>
 #include <linux/i2c.h>
 #include <linux/i2c-smbus.h>
 #include <linux/input.h>
@@ -33,29 +32,96 @@
 #define HYPERPIXEL_ROWS              7
 #define HYPERPIXEL_PIXELS_PER_ROW    68
 
+#define HYPERPIXEL_STATE_NOCONTACT   0
+#define HYPERPIXEL_STATE_CONTACT     1
+
 struct coords {
-	int x1;
-	int y1;
-	int x2;
-	int y2;
+	int x;
+	int y;
+	int state;
 };
 
 struct hyperpixel_dev {
 	struct i2c_client *client;
 	struct input_dev *input;
 	struct input_polled_dev *poll;
-	struct coords *last;
+	struct coords *last1;
+	struct coords *last2;
 	int width;
 	int height;
 };
+
+static void hyperpixel_touch_get_lines_from_coords(int max, int px_per,
+	int coord1, int coord2, int *out1, int *out2)
+{
+	int i;
+
+	// figure out which ADC channel lines to read from
+	for (i = 1; i <= max; i++) {
+		int done = 0;
+		int threshold = (px_per * i);
+
+		if ( coord1 < threshold ) {
+			done++;
+		} else {
+			(*out1)++;
+		}
+
+		if ( coord2 < threshold ) {
+			done++;
+		} else {
+			(*out2)++;
+		}
+
+		if (done == 2) {
+			break;
+		}
+	}
+}
+
+static void hyperpixel_touch_report_input(struct input_dev *input,
+	int contact_num, int x, int y, int state, struct coords *last)
+{
+	if (state) {
+		// send multitouch events
+		input_event(input, EV_ABS, ABS_MT_SLOT, contact_num);
+		input_report_abs(input, ABS_MT_TRACKING_ID, contact_num);
+		input_report_abs(input, ABS_MT_POSITION_X, x);
+		input_report_abs(input, ABS_MT_POSITION_Y, y);
+
+		// send touch event
+		input_report_key(input, BTN_TOUCH, 1);
+		// printk(KERN_INFO "HPX: touch %d down\n", contact_num);
+
+		// send traditional single-touch (ST) events
+		input_report_abs(input, ABS_X, x);
+		input_report_abs(input, ABS_Y, y);
+
+		input_event(input, EV_SYN, SYN_REPORT, 0);
+		input_sync(input);
+
+		last->x = x;
+		last->y = y;
+		last->state = 1;
+
+	} else if (last && last->state) {
+		input_event(input, EV_ABS, ABS_MT_SLOT, contact_num);
+		input_report_abs(input, ABS_MT_TRACKING_ID, -1);
+		input_report_key(input, BTN_TOUCH, 0);
+		// printk(KERN_INFO "HPX: touch %d up\n", contact_num);
+
+		input_event(input, EV_SYN, SYN_REPORT, 0);
+		input_sync(input);
+
+		last->state = 0;
+	}
+}
 
 static void hyperpixel_touch_sync(struct hyperpixel_dev *hpx)
 {
 	struct i2c_client *client = hpx->client;
 	struct input_dev *input = hpx->input;
 	int error = 0;
-	int col = 0;
-	int row = 0;
 	int sx1 = 0;
 	int sy1 = 0;
 	int sx2 = 0;
@@ -70,7 +136,6 @@ static void hyperpixel_touch_sync(struct hyperpixel_dev *hpx)
 	int y2 = 0;
 	int c1_down = 0;
 	int c2_down = 0;
-	int reported = 0;
 
 	u8 data[8];
 	s32 sx1_adc, sy1_adc, sx2_adc, sy2_adc;
@@ -100,149 +165,30 @@ static void hyperpixel_touch_sync(struct hyperpixel_dev *hpx)
 	y2 = hpx->height - sy2;
 
 	// figure out which ADC channel lines to read from
-	for (col = 1; col <= HYPERPIXEL_COLS; col++) {
-		int done = 0;
-		int threshold = (HYPERPIXEL_PIXELS_PER_COL * col);
+	hyperpixel_touch_get_lines_from_coords(HYPERPIXEL_COLS,
+		HYPERPIXEL_PIXELS_PER_COL, x1, x2, &x1_line, &x2_line);
 
-		if ( x1 < threshold ) {
-			done++;
-		} else {
-			x1_line++;
-		}
-
-		if ( x2 < threshold ) {
-			done++;
-		} else {
-			x2_line++;
-		}
-
-		if (done == 2) {
-			break;
-		}
-	}
-
-	for (row = 1; row <= HYPERPIXEL_ROWS; row++) {
-		int done = 0;
-		int threshold = (HYPERPIXEL_PIXELS_PER_ROW * row);
-
-		if ( y1 < threshold ) {
-			done++;
-		} else {
-			y1_line++;
-		}
-
-		if ( y2 < threshold ) {
-			done++;
-		} else {
-			y2_line++;
-		}
-
-		if (done == 2) {
-			break;
-		}
-	}
+	hyperpixel_touch_get_lines_from_coords(HYPERPIXEL_ROWS,
+		HYPERPIXEL_PIXELS_PER_ROW, y1, y2, &y1_line, &y2_line);
 
 	// read states of the ADC for the coordinates. this tells us if there is
 	// a touch registered at that location
+
+	// > contact 1
 	sx1_adc = i2c_smbus_read_word_data(client, x1_line);
 	sy1_adc = i2c_smbus_read_word_data(client, y1_line);
+	c1_down = (sx1_adc > 100 || sy1_adc > 100);
+
+	// > contact 2
 	sx2_adc = i2c_smbus_read_word_data(client, x2_line);
 	sy2_adc = i2c_smbus_read_word_data(client, y2_line);
-
-	c1_down = (sx1_adc > 100 || sy1_adc > 100);
 	c2_down = (sx2_adc > 100 || sy2_adc > 100);
 
-	// First Contact
-	// -------------
-	if (c1_down) {
-		if (sx1 && sy1) {
-			// send traditional single-touch (ST) events
-			input_report_abs(input, ABS_X, x1);
-			input_report_abs(input, ABS_Y, y1);
-			reported = 1;
+	// send input events
+	hyperpixel_touch_report_input(input, 0, x1, y1, c1_down, hpx->last1);
 
-			// send multitouch events
-			input_event(input, EV_ABS, ABS_MT_SLOT, 0);
-			input_report_abs(input, ABS_MT_TRACKING_ID, 0);
-			input_report_abs(input, ABS_MT_POSITION_X, x1);
-			input_report_abs(input, ABS_MT_POSITION_Y, y1);
-			input_report_key(input, BTN_TOUCH, 1);
-
-		} else if (!hpx->last || x1 != hpx->last->x1 || y1 != hpx->last->y1) {
-			if(hpx->last) {
-				if(x1 != hpx->last->x1) {
-					input_report_abs(input, ABS_X, x1);
-					reported = 1;
-				}
-
-				if(y1 != hpx->last->y1) {
-					input_report_abs(input, ABS_Y, y1);
-					reported = 1;
-				}
-
-			}
-
-			input_report_abs(input, ABS_MT_POSITION_X, x1);
-			input_report_abs(input, ABS_MT_POSITION_Y, y1);
-		}
-
-		input_event(input, EV_SYN, SYN_MT_REPORT, 0);
-	} else {
-		input_event(input, EV_ABS, ABS_MT_SLOT, 0);
-		input_report_abs(input, ABS_MT_TRACKING_ID, -1);
-		input_report_key(input, BTN_TOUCH, 0);
-	}
-
-	// Second Contact
-	// --------------
-	if (c2_down) {
-		if (sx2 && sy2) {
-			// send traditional single-touch (ST) events, but only if there
-			// wasn't any info for contact one
-			if (!sx1 && !sy1) {
-				input_report_abs(input, ABS_X, x2);
-				input_report_abs(input, ABS_Y, y2);
-				reported = 1;
-			}
-
-			// send multitouch events
-			input_event(input, EV_ABS, ABS_MT_SLOT, 1);
-			input_report_abs(input, ABS_MT_TRACKING_ID, 1);
-			input_report_abs(input, ABS_MT_POSITION_X, x2);
-			input_report_abs(input, ABS_MT_POSITION_Y, y2);
-			input_report_key(input, BTN_TOUCH, 1);
-
-		} else if (!hpx->last || x2 != hpx->last->x2 || y2 != hpx->last->y2) {
-			if(hpx->last) {
-				if(x2 != hpx->last->x2) {
-					input_report_abs(input, ABS_X, x2);
-					reported = 1;
-				}
-
-				if(y2 != hpx->last->y2) {
-					input_report_abs(input, ABS_Y, y2);
-					reported = 1;
-				}
-
-			}
-
-			input_report_abs(input, ABS_MT_POSITION_X, x2);
-			input_report_abs(input, ABS_MT_POSITION_Y, y2);
-		}
-
-		input_event(input, EV_SYN, SYN_MT_REPORT, 0);
-	} else {
-		input_event(input, EV_ABS, ABS_MT_SLOT, 1);
-		input_report_abs(input, ABS_MT_TRACKING_ID, -1);
-		input_report_key(input, BTN_TOUCH, 0);
-	}
-
-	input_event(input, EV_SYN, SYN_REPORT, 0);
-	input_sync(input);
-
-	if (reported) {
-		// printk(KERN_INFO "HPX: [1]=(%d,%d) [2]=(%d,%d)", x1, y1, x2, y2);
-		hpx->last = &(struct coords){ x1, y1, x2, y2 };
+	if(sx2 || sy2) {
+		hyperpixel_touch_report_input(input, 1, x2, y2, c2_down, hpx->last2);
 	}
 
 	return;
@@ -332,6 +278,8 @@ static int hyperpixel_touch_probe(struct i2c_client *client,
 
 	hpx->width = HYPERPIXEL_DEFAULT_WIDTH;
 	hpx->height = HYPERPIXEL_DEFAULT_HEIGHT;
+	hpx->last1 = &(struct coords){ 0, 0, 0 };
+	hpx->last2 = &(struct coords){ 0, 0, 0 };
 
 	if (!hpx) {
 		error = -ENOMEM;
